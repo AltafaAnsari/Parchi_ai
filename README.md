@@ -65,3 +65,6 @@ Parchi AI is an intelligent prescription explanation assistant built with **Sarv
 
 4. **Access in Browser**:
    Open **[http://localhost:8501](http://localhost:8501)** in your browser.
+
+5. **Deployed Link**:
+   Open **https://parchiai-nyzwhmuhbecgq692mrgbxu.streamlit.app/**.
