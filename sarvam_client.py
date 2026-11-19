@@ -3,9 +3,10 @@ import re
 import json
 import time
 import base64
+from io import BytesIO
+from zipfile import BadZipFile, ZipFile
 from typing import List, Optional
 import requests
-from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from prompts import EXPLANATION_SYSTEM_PROMPT
@@ -58,115 +59,6 @@ def clean_json_string(raw_text: str) -> str:
         text = text[start : end + 1]
     return text
 
-def clean_html_or_text(raw_text: str) -> str:
-    """
-    Cleans raw text or HTML returned by OCR/Doc AI into formatted plain text,
-    converting HTML tables and <br> elements to readable lines.
-    """
-    if not raw_text or not str(raw_text).strip():
-        return ""
-    text = str(raw_text).strip()
-    if "<" in text and ">" in text:
-        try:
-            soup = BeautifulSoup(text, "html.parser")
-            for br in soup.find_all(["br", "br/"]):
-                br.replace_with("\n")
-            table_rows = soup.find_all("tr")
-            if table_rows:
-                lines = []
-                for row in table_rows:
-                    cells = [c.get_text(separator=" ").strip() for c in row.find_all(["th", "td"])]
-                    row_str = " | ".join([c for c in cells if c])
-                    if row_str:
-                        lines.append(row_str)
-                if lines:
-                    return "\n".join(lines)
-            return soup.get_text("\n", strip=True)
-        except Exception:
-            return text
-    return text
-
-def parse_doc_ai_transcript(data) -> str:
-    """
-    Robustly extracts text from Sarvam Doc AI response whether returned as
-    a direct REST JSON dict or an SDK Pydantic model.
-    Handles blocks, pages, documents, HTML tables, and markdown content.
-    """
-    lines = []
-
-    def process_block(block):
-        if isinstance(block, dict):
-            t = block.get("text") or block.get("content") or ""
-        else:
-            t = getattr(block, "text", "") or getattr(block, "content", "") or ""
-        if t:
-            cleaned = clean_html_or_text(str(t))
-            if cleaned.strip():
-                lines.append(cleaned.strip())
-
-    def process_page(page):
-        if isinstance(page, dict):
-            blocks = page.get("blocks", [])
-            page_content = page.get("content") or page.get("text")
-        else:
-            blocks = getattr(page, "blocks", []) or []
-            page_content = getattr(page, "content", None) or getattr(page, "text", None)
-
-        if blocks:
-            for b in blocks:
-                process_block(b)
-        elif page_content:
-            cleaned = clean_html_or_text(str(page_content))
-            if cleaned.strip():
-                lines.append(cleaned.strip())
-
-    def process_document(doc):
-        if isinstance(doc, dict):
-            pages = doc.get("pages", [])
-            doc_content = doc.get("content") or doc.get("text")
-        else:
-            pages = getattr(doc, "pages", []) or []
-            doc_content = getattr(doc, "content", None) or getattr(doc, "text", None)
-
-        if pages:
-            for p in pages:
-                process_page(p)
-        elif doc_content:
-            cleaned = clean_html_or_text(str(doc_content))
-            if cleaned.strip():
-                lines.append(cleaned.strip())
-
-    if isinstance(data, dict):
-        docs = data.get("documents", [])
-        if not docs and "result" in data:
-            res = data["result"]
-            if isinstance(res, str):
-                lines.append(clean_html_or_text(res))
-            elif isinstance(res, dict):
-                for k, v in res.items():
-                    lines.append(f"{k}: {v}")
-        elif not docs and ("content" in data or "text" in data):
-            c = data.get("content") or data.get("text")
-            if c:
-                lines.append(clean_html_or_text(str(c)))
-        else:
-            for d in docs:
-                process_document(d)
-    else:
-        docs = getattr(data, "documents", None) or []
-        if docs:
-            for d in docs:
-                process_document(d)
-        elif hasattr(data, "result"):
-            res = getattr(data, "result")
-            if isinstance(res, str):
-                lines.append(clean_html_or_text(res))
-            elif isinstance(res, dict):
-                for k, v in res.items():
-                    lines.append(f"{k}: {v}")
-
-    return "\n".join(lines).strip()
-
 def digitise_prescription(
     file_bytes: bytes,
     filename: str = "prescription.png",
@@ -174,7 +66,7 @@ def digitise_prescription(
     max_timeout_sec: int = 45
 ) -> str:
     """
-    Submits a prescription image or PDF to Sarvam Vision (doc-ai/v1/job/digitise),
+    Submits a prescription image or PDF to Sarvam Vision (doc-ai/v1/job/parse),
     polls for completion, and extracts the transcript.
     """
     if not file_bytes:
@@ -193,9 +85,9 @@ def digitise_prescription(
 
     # Start digitise job
     try:
-        start_resp = client.doc_ai.digitise(
+        start_resp = client.doc_ai.parse(
             file=[(filename, file_bytes, mime_type)],
-            language="indic"
+            output_format="md"
         )
         job_id = start_resp.job_id
     except Exception as e:
@@ -204,20 +96,17 @@ def digitise_prescription(
             raise RuntimeError("Sarvam Vision error: Payment required or insufficient credits for Doc AI.")
         elif "403" in err_msg or "Forbidden" in err_msg:
             raise RuntimeError("Sarvam Vision error: API key does not have permission for Doc AI.")
-        raise RuntimeError(f"Failed to start Sarvam Vision digitise job: {err_msg}")
+        raise RuntimeError(f"Failed to start Sarvam Vision parse job: {err_msg}")
 
     # Poll status until terminal state or timeout
-    start_time = time.time()
+    deadline = time.monotonic() + max_timeout_sec
     terminal_statuses = {"completed", "partially_completed", "failed", "rejected"}
     last_status = "pending"
 
-    while time.time() - start_time < max_timeout_sec:
-        time.sleep(2.0)
-        try:
-            status_obj = client.doc_ai.get_status(job_id=job_id)
-            last_status = getattr(status_obj, "status", str(status_obj)).lower()
-        except Exception:
-            continue
+    while time.monotonic() < deadline:
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        status_obj = client.doc_ai.get_status(job_id=job_id)
+        last_status = status_obj.status.lower()
 
         if last_status in terminal_statuses:
             break
@@ -228,30 +117,24 @@ def digitise_prescription(
     if last_status in ("failed", "rejected"):
         raise RuntimeError(f"Sarvam Vision job was {last_status} by the server. Please ensure the document is clear, well-lit, and unblurred.")
 
-    # Retrieve and parse results
-    transcript = ""
-    api_key = get_sarvam_api_key()
-    headers = {"api-subscription-key": api_key}
-    results_url = f"https://api.sarvam.ai/doc-ai/v1/job/{job_id}/results"
-
-    # 1. Direct REST retrieval
+    # Sarvam returns the Markdown document inside a ZIP at a signed URL.
+    download = client.doc_ai.get_download_url(job_id=job_id)
     try:
-        resp = requests.get(results_url, headers=headers, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            transcript = parse_doc_ai_transcript(data)
-    except Exception:
-        pass
+        response = requests.get(download.url, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException:
+        raise RuntimeError("Failed to download Sarvam Vision results.") from None
 
-    # 2. SDK fallback if transcript not yet extracted
-    if not transcript:
-        try:
-            sdk_res = client.doc_ai.get_results(job_id=job_id)
-            transcript = parse_doc_ai_transcript(sdk_res)
-        except Exception as sdk_err:
-            raise RuntimeError(f"Failed to retrieve digitised results: {sdk_err}")
+    try:
+        with ZipFile(BytesIO(response.content)) as archive:
+            transcript = "\n".join(
+                archive.read(member).decode("utf-8-sig")
+                for member in archive.namelist()
+                if member.lower().endswith(".md")
+            ).strip()
+    except (BadZipFile, UnicodeDecodeError) as error:
+        raise RuntimeError("Sarvam Vision returned an unreadable OCR archive.") from error
 
-    transcript = transcript.strip()
     if not transcript:
         raise ValueError(
             f"Sarvam Vision processed the document (job ID: {job_id[:8]}...), but no legible text could be extracted. "

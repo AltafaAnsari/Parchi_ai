@@ -1,7 +1,7 @@
 # Parchi AI (पर्ची AI) 💊
 
 Parchi AI is an intelligent prescription explanation assistant built with **Sarvam AI** APIs:
-- **Sarvam Vision (Doc AI `digitise`)**: Extracts raw text from prescription camera photos, JPG/PNG uploads, or PDF documents.
+- **Sarvam Vision (Doc AI `parse`)**: Extracts raw text from prescription camera photos, JPG/PNG uploads, or PDF documents.
 - **Sarvam-105B (`sarvam-105b-conversations`)**: Explains reviewed prescriptions in simple Hindi or English with strict medical safety guardrails.
 - **Sarvam Bulbul (`bulbul:v3`)**: Generates natural, playable, and downloadable audio voice notes for the patient.
 
@@ -14,7 +14,7 @@ Parchi AI is an intelligent prescription explanation assistant built with **Sarv
    - Upload any JPG, PNG, or PDF file (`st.file_uploader`).
    - Or load the built-in **Fictional Sample** (two readable medicines + one unreadable medicine to demonstrate safety handling).
 2. **Sarvam Vision OCR**:
-   - Asynchronous digitisation job creation (`doc-ai/v1/job/digitise`).
+   - Asynchronous parse job creation (`doc-ai/v1/job/parse`).
    - Bounded status polling and result retrieval.
 3. **Transcript Review & Correction**:
    - Displays original document side-by-side with an editable transcript.
