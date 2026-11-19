@@ -7,6 +7,7 @@ from io import BytesIO
 from zipfile import BadZipFile, ZipFile
 from typing import List, Optional
 import requests
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from prompts import EXPLANATION_SYSTEM_PROMPT
@@ -83,12 +84,9 @@ def digitise_prescription(
     elif lower_name.endswith(".png"):
         mime_type = "image/png"
 
-    # Start digitise job
+    # Start the parse job using Sarvam's default HTML output.
     try:
-        start_resp = client.doc_ai.parse(
-            file=[(filename, file_bytes, mime_type)],
-            output_format="md"
-        )
+        start_resp = client.doc_ai.parse(file=[(filename, file_bytes, mime_type)])
         job_id = start_resp.job_id
     except Exception as e:
         err_msg = str(e)
@@ -117,7 +115,7 @@ def digitise_prescription(
     if last_status in ("failed", "rejected"):
         raise RuntimeError(f"Sarvam Vision job was {last_status} by the server. Please ensure the document is clear, well-lit, and unblurred.")
 
-    # Sarvam returns the Markdown document inside a ZIP at a signed URL.
+    # Sarvam returns the HTML document inside a ZIP at a signed URL.
     download = client.doc_ai.get_download_url(job_id=job_id)
     try:
         response = requests.get(download.url, timeout=20)
@@ -127,11 +125,20 @@ def digitise_prescription(
 
     try:
         with ZipFile(BytesIO(response.content)) as archive:
-            transcript = "\n".join(
-                archive.read(member).decode("utf-8-sig")
-                for member in archive.namelist()
-                if member.lower().endswith(".md")
-            ).strip()
+            sections = []
+            for member in archive.namelist():
+                if not member.lower().endswith((".html", ".htm")):
+                    continue
+                document = BeautifulSoup(archive.read(member).decode("utf-8-sig"), "html.parser")
+                body = document.body or document
+                for line_break in body.find_all("br"):
+                    line_break.replace_with("\n")
+                for row in body.find_all("tr"):
+                    cells = [cell.get_text().strip() for cell in row.find_all(["th", "td"])]
+                    if cells:
+                        row.replace_with(" | ".join(cells))
+                sections.append(body.get_text("\n", strip=True))
+            transcript = "\n\n".join(sections).strip()
     except (BadZipFile, UnicodeDecodeError) as error:
         raise RuntimeError("Sarvam Vision returned an unreadable OCR archive.") from error
 
